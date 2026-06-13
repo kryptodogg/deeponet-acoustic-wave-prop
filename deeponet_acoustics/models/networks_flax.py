@@ -218,7 +218,7 @@ class MLP(nn.Module):
                     kernel_init=self.kernel_init(),
                     name=f"linear_{self.tag}_{i}",
                 )(x)
-                x = self.activation(x)
+                x = self.activation(self.angular_freq * x)
 
         if output_layer_indx == -1:
             # output layer (no activation)
@@ -245,18 +245,17 @@ class ModMLP(nn.Module):
 
         U = nn.Dense(
             features=self.layers[0],
-            kernel_init=self.kernel_init(True),
+            kernel_init=self.kernel_init(),
             name=f"transformerU_{self.tag}",
         )(inputs)
         V = nn.Dense(
             features=self.layers[0],
-            kernel_init=self.kernel_init(True),
+            kernel_init=self.kernel_init(),
             name=f"transformerV_{self.tag}",
         )(inputs)
-        # NOTE: if the models from https://doi.org/10.11583/DTU.24812004 are used, please comment out the following two lines
 
-        U = self.activation(U)
-        V = self.activation(V)
+        U = self.activation(self.angular_freq * U)
+        V = self.activation(self.angular_freq * V)
 
         for i, feat in enumerate(self.layers[0:output_layer_indx]):
             if i == 0:
@@ -276,7 +275,7 @@ class ModMLP(nn.Module):
                     kernel_init=self.kernel_init(),
                     name=f"linear_{self.tag}_{i}",
                 )(outputs)
-                outputs = self.activation(outputs)
+                outputs = self.activation(self.angular_freq * outputs)
 
             outputs = jnp.multiply(outputs, U) + jnp.multiply(1 - outputs, V)
 

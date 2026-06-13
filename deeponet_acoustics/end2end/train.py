@@ -8,6 +8,7 @@
 # ==============================================================================
 import json
 import os
+import subprocess
 from typing import Any, Callable
 
 import numpy as np
@@ -127,6 +128,25 @@ def train(
         (tn_fnn, in_tn),
         settings.dirs.models_dir,
         transfer_learning=settings.transfer_learning,
+        checkpoint_dir=settings_dict.get("checkpoint_dir"),
+        checkpoint_metadata={
+            "training_config": settings_dict,
+            "dataset_manifest": settings_dict.get("dataset_manifest"),
+            "source_commit": settings_dict.get("source_commit"),
+            "upstream_repo_commit": subprocess.run(
+                ["git", "-C", os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "rev-parse", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            or "unknown",
+            "input_transform": {
+                "normalize_data": settings.normalize_data,
+                "u_p_range": [-2.0, 2.0],
+                "f0_feat": settings.f0_feat,
+                "tmax": settings.tmax,
+            },
+        },
     )
 
     ### Train ###
@@ -134,7 +154,7 @@ def train(
         dataloader,
         dataloader_val,
         nIter,
-        save_every=200,
+        save_every=int(settings_dict.get("save_checkpoint_every_epochs", 200)),
         progress_callback=progress_callback,
     )
     model.plotLosses(settings.dirs.figs_dir)

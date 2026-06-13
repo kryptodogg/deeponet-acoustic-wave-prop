@@ -7,7 +7,9 @@
 # Licensed under the MIT License.
 # ==============================================================================
 import collections
+import json
 import os
+from pathlib import Path
 from functools import partial
 from typing import Any, Callable
 
@@ -21,9 +23,13 @@ from flax import linen as nn
 from flax.training import checkpoints
 from jax import jit, random, vmap
 from jax.typing import ArrayLike
+import matplotlib
+matplotlib.use("Agg")
 from matplotlib import pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import trange
+import soundfile as sf
+import time
 
 from deeponet_acoustics.datahandlers.datagenerators import DataInterface
 from deeponet_acoustics.models import loss_functions
@@ -71,6 +77,8 @@ class DeepONet:
         module_tn: tuple[nn.Module, ArrayLike],
         log_dir,
         transfer_learning: TransferLearning | None = None,
+        checkpoint_dir: str | None = None,
+        checkpoint_metadata: dict[str, Any] | None = None,
     ) -> None:
         lr = settings.learning_rate
         if settings.use_adaptive_weights:
@@ -88,6 +96,8 @@ class DeepONet:
         self.step_offset = 0
 
         self.log_dir = log_dir
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        self.checkpoint_metadata = checkpoint_metadata or {}
         self.is_bn_fnn = module_bn[0].network_type != NetworkArchitectureType.RESNET
         dim_bn = module_bn[1]
         dim_tn = module_tn[1]
@@ -180,7 +190,7 @@ class DeepONet:
         label_fn = flattened_traversal(optimizerSelector, tags)
 
         self.optimizer = optax.chain(
-            optax.clip_by_global_norm(0.01),  # ensure no extreme flucturation in loss
+            optax.clip(0.1),  # per-element clipping at 0.1 per paper (not global norm)
             optax.multi_transform(
                 {
                     "opt": optax.adamw(learning_rate=self.opt_scheduler),
@@ -234,6 +244,7 @@ class DeepONet:
                 timer.endTiming("dataloader") if do_timings else None
 
                 i += 1
+                self._current_step = i
 
                 if do_timings:
                     timer.startTiming("backprop")
@@ -258,6 +269,10 @@ class DeepONet:
                     self.params, self.opt_state, _ = self.step(
                         self.params, self.opt_state, data_batch
                     )
+
+                if i % 100 == 0:
+                    import sys
+                    print(f"[heartbeat] step {i}/{start + nIter}", flush=True, file=sys.stderr)
 
                 if i % save_every == 0:
                     self.writeState(i, pbar_epochs, dataloader, dataloader_val, writer)
@@ -400,9 +415,11 @@ class DeepONet:
 
         # Save loss to disk
         self.writeSummary(writer, loss_train_value, loss_val_value, it)
+        self.writeExperimentEvidence(it, loss_train_value, loss_val_value, dataloader_val)
 
         # Save model to disk
         self.writeModel(it)  # , write_separate=True
+        self.writeTrainingCheckpoint(it)
 
     def writeModel(self, iter):
         orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
@@ -413,6 +430,88 @@ class DeepONet:
             overwrite=False,
             orbax_checkpointer=orbax_checkpointer,
         )
+
+    def writeTrainingCheckpoint(self, iteration):
+        if self.checkpoint_dir is None:
+            return
+
+        checkpoint_path = self.checkpoint_dir / f"epoch_{iteration:04d}"
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        checkpointer.save(
+            checkpoint_path.resolve(),
+            {
+                "params": self.params,
+                "opt_state": self.opt_state,
+                "step": jnp.asarray(iteration, dtype=jnp.int32),
+            },
+            force=True,
+        )
+        metadata = {
+            **self.checkpoint_metadata,
+            "checkpoint_format": "orbax_pytree",
+            "step": int(iteration),
+            "state_keys": ["params", "opt_state", "step"],
+        }
+        (checkpoint_path / "checkpoint_metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+
+    def writeExperimentEvidence(self, it, loss_train, loss_val, dataloader_val):
+        try:
+            # 1. Calculate metrics
+            batch = next(iter(dataloader_val))
+            inputs, targets, _, _ = batch
+            branch_input, trunk_input = inputs
+            
+            # predict_s(params, branch_input, trunk_input)
+            # Use first sample in batch for quick validation
+            pred = np.asarray(self.predict_s(self.params, branch_input[0], trunk_input[0]))
+            tgt = np.asarray(targets[0]).flatten()
+            
+            mse = float(np.mean((pred.flatten() - tgt) ** 2))
+            zero_rmse = float(np.sqrt(np.mean(tgt**2)))
+            rel_rmse = float(np.sqrt(mse)) / zero_rmse if zero_rmse > 0 else 1.0
+            improvement_db = float(10 * np.log10(zero_rmse**2 / mse)) if mse > 0 else 0.0
+            
+            metrics_path = Path(self.log_dir) / "metrics.jsonl"
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps({
+                    "step": int(it),
+                    "train_loss": float(loss_train),
+                    "val_loss": float(loss_val),
+                    "rel_rmse": round(rel_rmse, 4),
+                    "db_over_zero": round(improvement_db, 2),
+                    "timestamp": time.time()
+                }) + "\n")
+                
+            # 2. Plot loss curve
+            plt.figure(figsize=(10, 6))
+            plt.plot(self.loss_logger.nIter, self.loss_logger.loss_train, label="Train")
+            plt.plot(self.loss_logger.nIter, self.loss_logger.loss_val, label="Val")
+            plt.yscale("log")
+            plt.xlabel("Step")
+            plt.ylabel("Loss")
+            plt.legend()
+            plt.title(f"DeepONet Loss Curve (Step {it})")
+            plots_dir = Path(self.log_dir) / "plots"
+            plots_dir.mkdir(exist_ok=True)
+            plt.savefig(plots_dir / f"loss_curve_{it:06d}.png")
+            plt.close()
+            
+            # 3. Audio snippet
+            audio_dir = Path(self.log_dir) / "audio"
+            audio_dir.mkdir(exist_ok=True)
+            min_len = min(len(pred.flatten()), len(tgt))
+            stereo = np.stack([pred.flatten()[:min_len], tgt[:min_len]], axis=-1)
+            # Use 2005 Hz as found in simulation_parameters.json
+            sf.write(audio_dir / f"pred_vs_gt_{it:06d}.wav", stereo, 2005)
+            
+            print(f"[tracking] Step {it}: rel_rmse={rel_rmse:.4f}, improvement={improvement_db:.2f}dB")
+        except Exception as e:
+            print(f"[tracking] Failed to write evidence at step {it}: {e}")
 
     def writeSummary(self, writer, loss_train, loss_val, iter):
         writer.add_scalar("Loss/train/loss", np.array(loss_train), iter)
@@ -437,9 +536,19 @@ def loadLosses(path: str):
     event_acc = EventAccumulator(path)
     event_acc.Reload()
 
-    step_offset = event_acc.Scalars("Loss/learning_rate")[-1].step
-    nIter = list(map(lambda e: e.step, event_acc.Scalars("Loss/train/loss")))
-    loss_train = list(map(lambda e: e.value, event_acc.Scalars("Loss/train/loss")))
-    loss_val = list(map(lambda e: e.value, event_acc.Scalars("Loss/val/loss")))
+    scalar_tags = set(event_acc.Tags().get("scalars", []))
+
+    def scalar_events(tag):
+        return event_acc.Scalars(tag) if tag in scalar_tags else []
+
+    learning_rate_events = scalar_events("Loss/learning_rate")
+    train_events = scalar_events("Loss/train/loss")
+    val_events = scalar_events("Loss/val/loss")
+    available_events = learning_rate_events or train_events or val_events
+
+    step_offset = available_events[-1].step if available_events else 0
+    nIter = [event.step for event in train_events]
+    loss_train = [event.value for event in train_events]
+    loss_val = [event.value for event in val_events]
 
     return step_offset, LossLogger(loss_train, loss_val, nIter)

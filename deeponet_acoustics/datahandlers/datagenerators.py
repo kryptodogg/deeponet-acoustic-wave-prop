@@ -462,9 +462,8 @@ class DataH5Compact(DataInterface):
     def u_pressures(self, idx: int) -> np.ndarray:
         """Get normalized u pressures for a given dataset index."""
         dataset = self.datasets[idx]
-        u_norm = _normalize_spatial(
-            dataset[self.tag_ufield][:], self._u_p_min, self._u_p_max
-        )
+        # The published 2023 checkpoints used a fixed [-2, 2] pressure range.
+        u_norm = dataset[self.tag_ufield][:] / 2.0
         return jnp.reshape(u_norm, self.u_shape)
 
     def __del__(self):
