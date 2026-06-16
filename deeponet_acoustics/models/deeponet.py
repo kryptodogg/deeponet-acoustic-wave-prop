@@ -82,10 +82,12 @@ class DeepONet:
     ) -> None:
         lr = settings.learning_rate
         if settings.use_adaptive_weights:
-            adaptive_weights_shape = (
-                min(settings.batch_size_branch, dataset.N)
-                * min(settings.batch_size_coord, dataset.P),
-            )
+            # adaptive_weights_shape must cover ALL coordinate indices (not just
+            # one batch).  coordinate indices from __getitem__ are in [0, dataset.P)
+            # per sample.  The original min(batch, N) truncation caused out-of-bounds
+            # scatter writes on ROCm → silent exit 139.
+            # FIX (2026-06-16): use dataset.P, not min(batch_size, N) * min(batch_size, P).
+            adaptive_weights_shape = (dataset.P,)
         else:
             adaptive_weights_shape = []
 
@@ -338,21 +340,30 @@ class DeepONet:
         grads = traverse_dict(lambda k, v: -v if TAG_ADAPTIVE in k else v, grads)
         grads = flax.core.frozen_dict.freeze(grads)
 
-        # update network parameters and adaptive weights
-        updates, opt_state = self.optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
+        # Scatter batch-subset adaptive_weights grads into a full-size zero array
+        # so optax sees matching shapes between grads, opt_state, and params_all.
+        # Without this, opt_state tracks (dataset.P,) but grads are (batch_size,).
+        # Uses .add() (not .set()) so duplicate coordinate indices across batched
+        # samples accumulate gradients additively — correct for same-coordinate
+        # contributions from different source positions.
+        if TAG_ADAPTIVE in grads:
+            grad_aw_full = jnp.zeros_like(params_all[TAG_ADAPTIVE])
+            grad_aw_full = grad_aw_full.at[idx_coord].add(grads[TAG_ADAPTIVE])
+            grads = flax.core.frozen_dict.freeze({
+                **{k: v for k, v in grads.items() if k != TAG_ADAPTIVE},
+                TAG_ADAPTIVE: grad_aw_full,
+            })
 
-        def clip_and_combine_adaptive_weights(k, v):
-            if TAG_ADAPTIVE in k:
-                adaptive_weights_all = params_all[TAG_ADAPTIVE]
-                weights_clipped = jnp.clip(params[TAG_ADAPTIVE], 0, 1000)
-                return adaptive_weights_all.at[idx_coord].set(weights_clipped)
-            else:
-                return v
+        # update ALL parameters (full adaptive_weights array, not just batch subset)
+        updates, opt_state = self.optimizer.update(grads, opt_state, params_all)
+        params = optax.apply_updates(params_all, updates)
 
-        # re-insert the updated adaptive weights for this batch into the full list of weights (and clip)
-        params = traverse_dict(clip_and_combine_adaptive_weights, params)
-        params = flax.core.frozen_dict.freeze(params)
+        # clip adaptive_weights to [0, 1000] per paper
+        if TAG_ADAPTIVE in params:
+            params = flax.core.frozen_dict.freeze({
+                **{k: v for k, v in params.items() if k != TAG_ADAPTIVE},
+                TAG_ADAPTIVE: jnp.clip(params[TAG_ADAPTIVE], 0, 1000),
+            })
 
         return params, opt_state, loss_value
 
