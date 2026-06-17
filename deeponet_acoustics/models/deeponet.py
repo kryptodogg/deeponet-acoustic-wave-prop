@@ -355,8 +355,13 @@ class DeepONet:
             })
 
         # update ALL parameters (full adaptive_weights array, not just batch subset)
-        updates, opt_state = self.optimizer.update(grads, opt_state, params_all)
-        params = optax.apply_updates(params_all, updates)
+        # Wrap params_all in FrozenDict to match the optimizer's mask tree structure,
+        # then unfreeze for apply_updates which expects plain dicts.
+        params_all_frozen = flax.core.frozen_dict.freeze(params_all)
+        updates, opt_state = self.optimizer.update(grads, opt_state, params_all_frozen)
+        params_all_unfrozen = flax.core.frozen_dict.unfreeze(params_all_frozen)
+        updates_unfrozen = flax.core.frozen_dict.unfreeze(updates)
+        params = optax.apply_updates(params_all_unfrozen, updates_unfrozen)
 
         # clip adaptive_weights to [0, 1000] per paper
         if TAG_ADAPTIVE in params:
